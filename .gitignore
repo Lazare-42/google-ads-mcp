@@ -1,0 +1,5 @@
+/target
+/result
+.env
+*.pem
+*.json.key
