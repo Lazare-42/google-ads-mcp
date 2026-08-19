@@ -14,7 +14,7 @@ const SCOPE: &str = "https://www.googleapis.com/auth/adwords";
 const DEFAULT_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 const REFRESH_SKEW_SECS: u64 = 60;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ServiceAccountKey {
     client_email: String,
     private_key: String,
@@ -43,7 +43,7 @@ struct TokenResponse {
     expires_in: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CachedToken {
     access_token: String,
     refresh_at: u64,
@@ -123,15 +123,12 @@ impl GoogleAuth {
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
-            return Err(Error::Auth(format!(
-                "token endpoint returned {status}: {body}"
-            )));
+            return Err(Error::Auth(format!("token endpoint returned {status}")));
         }
-        let token: TokenResponse = serde_json::from_str(&body).map_err(|e| {
-            Error::Auth(format!(
-                "failed to parse token response: {e} (body: {body})"
-            ))
-        })?;
+        // Never include the OAuth response body in an error. A malformed successful
+        // response could still contain a usable access token.
+        let token: TokenResponse = serde_json::from_str(&body)
+            .map_err(|e| Error::Auth(format!("failed to parse token response: {e}")))?;
         Ok(CachedToken {
             access_token: token.access_token,
             refresh_at: Self::now_secs() + token.expires_in.saturating_sub(REFRESH_SKEW_SECS),

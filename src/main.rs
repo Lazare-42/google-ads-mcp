@@ -61,7 +61,7 @@ fn parse_transport() -> Result<Transport> {
 
 fn print_usage() {
     eprintln!(
-        "google-ads-mcp {version}\n\nUSAGE:\n  google-ads-mcp [--stdio | --http <BIND>]\n\nENV:\n  GOOGLE_APPLICATION_CREDENTIALS  service-account JSON key path\n  GOOGLE_ADS_DEVELOPER_TOKEN       Google Ads API developer token\n  GOOGLE_ADS_CUSTOMER_ID           default 10-digit client customer ID\n  GOOGLE_ADS_LOGIN_CUSTOMER_ID     optional manager account ID\n  GOOGLE_ADS_API_VERSION           default v25\n  GOOGLE_ADS_MUTATIONS_ENABLED     true to permit confirmed guarded writes\n  GOOGLE_ADS_ALLOWED_CUSTOMER_IDS  comma-separated mutation allowlist\n",
+        "google-ads-mcp {version}\n\nUSAGE:\n  google-ads-mcp [--stdio | --http <BIND>]\n\nENV:\n  GOOGLE_APPLICATION_CREDENTIALS       service-account JSON key path\n  GOOGLE_ADS_DEVELOPER_TOKEN            Google Ads API developer token\n  GOOGLE_ADS_CUSTOMER_ID                default 10-digit client customer ID\n  GOOGLE_ADS_LOGIN_CUSTOMER_ID          optional manager account ID\n  GOOGLE_ADS_API_VERSION                default v25\n  GOOGLE_ADS_MUTATIONS_ENABLED          true to permit confirmed guarded writes\n  GOOGLE_ADS_ALLOWED_CUSTOMER_IDS       comma-separated mutation allowlist\n  GOOGLE_ADS_MAX_BID_INCREASE_PERCENT   maximum keyword bid increase, default 25\n",
         version = env!("CARGO_PKG_VERSION")
     );
 }

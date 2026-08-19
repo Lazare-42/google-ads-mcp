@@ -45,6 +45,17 @@ pub struct GaqlArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SegmentPerformanceArgs {
+    pub customer_id: Option<String>,
+    pub start_date: String,
+    pub end_date: String,
+    /// device, day_of_week, hour, or network.
+    pub breakdown: String,
+    /// Maximum rows, 1..1000. Defaults to 100.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CampaignStatusArgs {
     pub customer_id: Option<String>,
     pub campaign_id: String,
@@ -180,6 +191,170 @@ impl GoogleAdsServer {
     }
 
     #[tool(
+        description = "Ad-group spend, CPC, and conversion performance, ordered by spend.",
+        annotations(read_only_hint = true)
+    )]
+    async fn ad_group_performance(
+        &self,
+        Parameters(args): Parameters<LimitedDateRangeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = self
+            .client
+            .ad_group_performance(
+                args.customer_id.as_deref(),
+                &args.start_date,
+                &args.end_date,
+                args.limit.unwrap_or(100),
+            )
+            .await
+            .map_err(Self::err)?;
+        Self::ok(&value)
+    }
+
+    #[tool(
+        description = "Ad-level spend and conversion performance with RSA headlines, descriptions, and final URLs.",
+        annotations(read_only_hint = true)
+    )]
+    async fn ad_performance(
+        &self,
+        Parameters(args): Parameters<LimitedDateRangeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = self
+            .client
+            .ad_performance(
+                args.customer_id.as_deref(),
+                &args.start_date,
+                &args.end_date,
+                args.limit.unwrap_or(100),
+            )
+            .await
+            .map_err(Self::err)?;
+        Self::ok(&value)
+    }
+
+    #[tool(
+        description = "Keyword performance with match type, quality score, effective CPC bid, spend, and conversions.",
+        annotations(read_only_hint = true)
+    )]
+    async fn keyword_performance(
+        &self,
+        Parameters(args): Parameters<LimitedDateRangeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = self
+            .client
+            .keyword_performance(
+                args.customer_id.as_deref(),
+                &args.start_date,
+                &args.end_date,
+                args.limit.unwrap_or(100),
+            )
+            .await
+            .map_err(Self::err)?;
+        Self::ok(&value)
+    }
+
+    #[tool(
+        description = "Performance grouped by device, day of week, hour, or ad network for scheduling and targeting decisions.",
+        annotations(read_only_hint = true)
+    )]
+    async fn traffic_segment_performance(
+        &self,
+        Parameters(args): Parameters<SegmentPerformanceArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = self
+            .client
+            .traffic_segment_performance(
+                args.customer_id.as_deref(),
+                &args.start_date,
+                &args.end_date,
+                &args.breakdown,
+                args.limit.unwrap_or(100),
+            )
+            .await
+            .map_err(Self::err)?;
+        Self::ok(&value)
+    }
+
+    #[tool(
+        description = "Campaign performance by geographic location for country and presence/interest cleanup.",
+        annotations(read_only_hint = true)
+    )]
+    async fn geographic_performance(
+        &self,
+        Parameters(args): Parameters<LimitedDateRangeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = self
+            .client
+            .geographic_performance(
+                args.customer_id.as_deref(),
+                &args.start_date,
+                &args.end_date,
+                args.limit.unwrap_or(100),
+            )
+            .await
+            .map_err(Self::err)?;
+        Self::ok(&value)
+    }
+
+    #[tool(
+        description = "Paid landing-page spend and conversion performance by final URL.",
+        annotations(read_only_hint = true)
+    )]
+    async fn landing_page_performance(
+        &self,
+        Parameters(args): Parameters<LimitedDateRangeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = self
+            .client
+            .landing_page_performance(
+                args.customer_id.as_deref(),
+                &args.start_date,
+                &args.end_date,
+                args.limit.unwrap_or(100),
+            )
+            .await
+            .map_err(Self::err)?;
+        Self::ok(&value)
+    }
+
+    #[tool(
+        description = "Recent Google Ads change history (maximum API-supported history is 30 days).",
+        annotations(read_only_hint = true)
+    )]
+    async fn change_history(
+        &self,
+        Parameters(args): Parameters<LimitedDateRangeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = self
+            .client
+            .change_history(
+                args.customer_id.as_deref(),
+                &args.start_date,
+                &args.end_date,
+                args.limit.unwrap_or(100),
+            )
+            .await
+            .map_err(Self::err)?;
+        Self::ok(&value)
+    }
+
+    #[tool(
+        description = "List active Google Ads recommendations for review. No apply-recommendation tool is exposed.",
+        annotations(read_only_hint = true)
+    )]
+    async fn recommendations(
+        &self,
+        Parameters(args): Parameters<CustomerArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = self
+            .client
+            .recommendations(args.customer_id.as_deref())
+            .await
+            .map_err(Self::err)?;
+        Self::ok(&value)
+    }
+
+    #[tool(
         description = "List configured conversion actions and whether each is primary/included in Conversions.",
         annotations(read_only_hint = true)
     )]
@@ -217,7 +392,7 @@ impl GoogleAdsServer {
     }
 
     #[tool(
-        description = "Search terms with spend and conversion performance, useful for negatives and targeting cleanup.",
+        description = "Google Ads search terms with spend and conversions. Email/phone-like values are redacted best-effort; free text can still contain PII and must be treated as sensitive.",
         annotations(read_only_hint = true)
     )]
     async fn search_terms(
@@ -238,7 +413,7 @@ impl GoogleAdsServer {
     }
 
     #[tool(
-        description = "Run one arbitrary read-only GAQL SELECT query. No mutate endpoint is exposed through this tool.",
+        description = "Run one arbitrary read-only GAQL SELECT query. Unredacted search terms, direct lead/user data, and click-level identifiers are blocked; no mutate endpoint is exposed.",
         annotations(read_only_hint = true)
     )]
     async fn run_gaql(
@@ -247,7 +422,7 @@ impl GoogleAdsServer {
     ) -> Result<CallToolResult, McpError> {
         let value = self
             .client
-            .search(
+            .run_gaql(
                 args.customer_id.as_deref(),
                 &args.query,
                 args.page_token.as_deref(),
@@ -279,7 +454,7 @@ impl GoogleAdsServer {
     }
 
     #[tool(
-        description = "Preview or apply keyword status/max-CPC changes. Daily campaign budgets stay unchanged.",
+        description = "Preview or apply keyword status/max-CPC changes. Bid increases are capped against the current effective bid; daily campaign budgets stay unchanged.",
         annotations(destructive_hint = true)
     )]
     async fn set_keyword(
@@ -349,7 +524,7 @@ impl ServerHandler for GoogleAdsServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(implementation)
             .with_instructions(
-                "Google Ads reporting and guarded optimization for Meeting BaaS. Read first, then preview mutations with confirm=false. Apply only after reviewing the preview and setting confirm=true. Mutations also require a server-side enable flag and customer allowlist. Budget rebalances are atomic and rejected when the requested sum exceeds the current sum. No unrestricted mutate, campaign removal, ad creation, or conversion deletion tool exists.",
+                "Google Ads reporting and guarded optimization for Meeting BaaS. Read first, then preview mutations with confirm=false. Apply only after reviewing the preview and setting confirm=true. Mutations also require a server-side enable flag and explicit customer allowlist. Keyword bid increases are capped against the current Google Ads value. Budget rebalances are atomic, limited to DAILY budgets, and rejected when the requested sum exceeds the current sum. Search-term email/phone-like values are redacted best-effort, but all report output remains sensitive. Raw GAQL blocks direct lead/user data, unredacted search terms, and click-level identifiers. No unrestricted mutate, campaign removal, ad creation, or conversion deletion tool exists.",
             )
     }
 }

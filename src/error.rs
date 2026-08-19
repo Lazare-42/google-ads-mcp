@@ -8,10 +8,10 @@ pub enum Error {
     Config(String),
     #[error("invalid request: {0}")]
     Invalid(String),
-    #[error("Google Ads API returned {status}: {body}")]
+    #[error("Google Ads API returned {status} (request ID: {request_id})")]
     Api {
         status: reqwest::StatusCode,
-        body: String,
+        request_id: String,
     },
     #[error(transparent)]
     Http(#[from] reqwest::Error),
