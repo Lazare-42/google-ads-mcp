@@ -6,7 +6,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::ads::{BudgetAllocation, GoogleAdsClient};
+use crate::ads::{AdTextReplacement, BudgetAllocation, GoogleAdsClient};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EmptyArgs {}
@@ -86,6 +86,17 @@ pub struct NegativeKeywordArgs {
     pub text: String,
     /// EXACT, PHRASE, or BROAD.
     pub match_type: String,
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ResponsiveSearchAdTextArgs {
+    pub customer_id: Option<String>,
+    pub ad_group_id: String,
+    pub ad_id: String,
+    /// Exact existing text and its approved replacement. All entries must match.
+    pub replacements: Vec<AdTextReplacement>,
     #[serde(default)]
     pub confirm: bool,
 }
@@ -499,6 +510,28 @@ impl GoogleAdsServer {
     }
 
     #[tool(
+        description = "Preview or atomically replace exact text in one enabled responsive search ad. Creates the corrected RSA and pauses only the selected old RSA; final URLs and URL tracking fields are preserved.",
+        annotations(destructive_hint = true)
+    )]
+    async fn replace_responsive_search_ad_text(
+        &self,
+        Parameters(args): Parameters<ResponsiveSearchAdTextArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = self
+            .client
+            .replace_responsive_search_ad_text(
+                args.customer_id.as_deref(),
+                &args.ad_group_id,
+                &args.ad_id,
+                &args.replacements,
+                args.confirm,
+            )
+            .await
+            .map_err(Self::err)?;
+        Self::ok(&value)
+    }
+
+    #[tool(
         description = "Preview or atomically rebalance existing daily budgets. Hard guard rejects any increase in the summed budgets supplied.",
         annotations(destructive_hint = true)
     )]
@@ -524,7 +557,7 @@ impl ServerHandler for GoogleAdsServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(implementation)
             .with_instructions(
-                "Google Ads reporting and guarded optimization for Meeting BaaS. Read first, then preview mutations with confirm=false. Apply only after reviewing the preview and setting confirm=true. Mutations also require a server-side enable flag and explicit customer allowlist. Keyword bid increases are capped against the current Google Ads value. Budget rebalances are atomic, limited to DAILY budgets, and rejected when the requested sum exceeds the current sum. Search-term email/phone-like values are redacted best-effort, but all report output remains sensitive. Raw GAQL blocks direct lead/user data, unredacted search terms, and click-level identifiers. No unrestricted mutate, campaign removal, ad creation, or conversion deletion tool exists.",
+                "Google Ads reporting and guarded optimization for Meeting BaaS. Read first, then preview mutations with confirm=false. Apply only after reviewing the preview and setting confirm=true. Mutations also require a server-side enable flag and explicit customer allowlist. Keyword bid increases are capped against the current Google Ads value. Budget rebalances are atomic, limited to DAILY budgets, and rejected when the requested sum exceeds the current sum. RSA text replacement fetches one known enabled ad, requires exact source text, preserves its URL configuration, then atomically creates the corrected RSA and pauses only that selected ad. Search-term email/phone-like values are redacted best-effort, but all report output remains sensitive. Raw GAQL blocks direct lead/user data, unredacted search terms, and click-level identifiers. No unrestricted mutate, campaign removal, arbitrary ad creation, or conversion deletion tool exists.",
             )
     }
 }

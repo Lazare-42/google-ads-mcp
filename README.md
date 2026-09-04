@@ -17,8 +17,9 @@ It supports stdio and Streamable HTTP (`/mcp`).
 - Budget rebalances fetch current values first and reject a requested sum
   above the current sum. The accepted operations are sent atomically.
 - Confirmed changes are written to the systemd journal without credentials.
-- Campaign removal, ad creation, conversion deletion, and raw mutations are
-  deliberately not exposed.
+- Campaign removal, arbitrary ad creation, conversion deletion, and raw
+  mutations are deliberately not exposed. RSA copy replacement is constrained
+  to exact text in one known enabled ad and atomically pauses only that old ad.
 
 ## Privacy boundary
 
@@ -72,4 +73,5 @@ Read: `get_setup_status`, `list_accessible_customers`, `account_performance`,
 `search_terms`, `run_gaql`.
 
 Guarded write: `set_campaign_status`, `set_keyword`,
-`add_negative_keyword`, `rebalance_budgets`.
+`add_negative_keyword`, `replace_responsive_search_ad_text`,
+`rebalance_budgets`.

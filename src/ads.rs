@@ -56,6 +56,15 @@ pub struct BudgetAllocation {
     pub amount_micros: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AdTextReplacement {
+    /// Existing headline or description text to replace exactly.
+    pub from: String,
+    /// New headline (maximum 30 characters) or description (maximum 90 characters).
+    pub to: String,
+}
+
 impl AdsConfig {
     pub fn from_env() -> Result<Self> {
         let api_version = std::env::var("GOOGLE_ADS_API_VERSION")
@@ -901,6 +910,182 @@ impl GoogleAdsClient {
         Ok(json!({ "mode": "applied", "plan": plan, "response": response }))
     }
 
+    pub async fn replace_responsive_search_ad_text(
+        &self,
+        customer_id: Option<&str>,
+        ad_group_id: &str,
+        ad_id: &str,
+        replacements: &[AdTextReplacement],
+        confirm: bool,
+    ) -> Result<Value> {
+        let customer_id = self.customer_id(customer_id)?;
+        let ad_group_id = numeric_id(ad_group_id, "ad_group_id")?;
+        let ad_id = numeric_id(ad_id, "ad_id")?;
+        if replacements.is_empty() || replacements.len() > 10 {
+            return Err(Error::Invalid(
+                "replacements must contain between 1 and 10 entries".into(),
+            ));
+        }
+
+        let mut requested = HashMap::new();
+        for replacement in replacements {
+            if replacement.from.is_empty()
+                || replacement.to.is_empty()
+                || replacement.from.chars().any(char::is_control)
+                || replacement.to.chars().any(char::is_control)
+            {
+                return Err(Error::Invalid(
+                    "replacement text must be non-empty and contain no control characters".into(),
+                ));
+            }
+            if requested
+                .insert(replacement.from.as_str(), replacement.to.as_str())
+                .is_some()
+            {
+                return Err(Error::Invalid("replacement sources must be unique".into()));
+            }
+        }
+
+        let query = format!(
+            "SELECT ad_group_ad.ad.id, ad_group_ad.status, ad_group_ad.ad.type, \
+             ad_group_ad.ad.final_urls, ad_group_ad.ad.tracking_url_template, \
+             ad_group_ad.ad.final_url_suffix, ad_group_ad.ad.url_custom_parameters, \
+             ad_group_ad.ad.responsive_search_ad.headlines, \
+             ad_group_ad.ad.responsive_search_ad.descriptions, \
+             ad_group_ad.ad.responsive_search_ad.path1, \
+             ad_group_ad.ad.responsive_search_ad.path2 \
+             FROM ad_group_ad WHERE ad_group.id = {ad_group_id} \
+             AND ad_group_ad.ad.id = {ad_id} LIMIT 1"
+        );
+        let response = self.search(Some(&customer_id), &query, None).await?;
+        let ad_group_ad = response
+            .get("results")
+            .and_then(Value::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get("adGroupAd"))
+            .ok_or_else(|| Error::Invalid("RSA lookup returned no matching ad".into()))?;
+        if ad_group_ad.get("status").and_then(Value::as_str) != Some("ENABLED") {
+            return Err(Error::Invalid("only an ENABLED RSA can be replaced".into()));
+        }
+        let ad = ad_group_ad
+            .get("ad")
+            .and_then(Value::as_object)
+            .ok_or_else(|| Error::Invalid("RSA lookup result is missing ad".into()))?;
+        if ad.get("type").and_then(Value::as_str) != Some("RESPONSIVE_SEARCH_AD") {
+            return Err(Error::Invalid(
+                "the selected ad is not a responsive search ad".into(),
+            ));
+        }
+        let rsa = ad
+            .get("responsiveSearchAd")
+            .and_then(Value::as_object)
+            .ok_or_else(|| Error::Invalid("RSA payload is missing".into()))?;
+
+        let mut matched = HashSet::new();
+        let headlines = replaced_text_assets(
+            rsa.get("headlines"),
+            &requested,
+            30,
+            "headline",
+            &mut matched,
+        )?;
+        let descriptions = replaced_text_assets(
+            rsa.get("descriptions"),
+            &requested,
+            90,
+            "description",
+            &mut matched,
+        )?;
+        if matched.len() != requested.len() {
+            let missing = requested
+                .keys()
+                .filter(|text| !matched.contains(**text))
+                .copied()
+                .collect::<Vec<_>>();
+            return Err(Error::Invalid(format!(
+                "replacement source text was not found exactly: {}",
+                missing.join(", ")
+            )));
+        }
+
+        let final_urls = ad
+            .get("finalUrls")
+            .and_then(Value::as_array)
+            .filter(|urls| !urls.is_empty())
+            .cloned()
+            .ok_or_else(|| Error::Invalid("RSA has no final URLs".into()))?;
+        let mut new_ad = json!({
+            "finalUrls": final_urls,
+            "responsiveSearchAd": {
+                "headlines": headlines,
+                "descriptions": descriptions,
+            }
+        });
+        copy_optional_string(ad, &mut new_ad, "trackingUrlTemplate");
+        copy_optional_string(ad, &mut new_ad, "finalUrlSuffix");
+        if let Some(parameters) = ad.get("urlCustomParameters") {
+            new_ad["urlCustomParameters"] = parameters.clone();
+        }
+        if let Some(path1) = rsa
+            .get("path1")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        {
+            new_ad["responsiveSearchAd"]["path1"] = json!(path1);
+        }
+        if let Some(path2) = rsa
+            .get("path2")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        {
+            new_ad["responsiveSearchAd"]["path2"] = json!(path2);
+        }
+
+        let plan = json!({
+            "operation": "replace_responsive_search_ad_text",
+            "customerId": customer_id,
+            "adGroupId": ad_group_id,
+            "adId": ad_id,
+            "replacements": replacements,
+            "budgetChangeMicros": 0,
+            "effect": "create corrected RSA and pause the selected RSA atomically",
+        });
+        if !confirm {
+            return Ok(json!({ "mode": "preview", "confirmRequired": true, "plan": plan }));
+        }
+
+        let customer_id = self.mutation_customer(Some(&customer_id))?;
+        tracing::warn!(%customer_id, %ad_group_id, %ad_id, "confirmed Google Ads RSA replacement");
+        let response = self
+            .mutate(
+                &customer_id,
+                "adGroupAds",
+                json!({
+                    "operations": [
+                        {
+                            "create": {
+                                "adGroup": format!("customers/{customer_id}/adGroups/{ad_group_id}"),
+                                "status": "ENABLED",
+                                "ad": new_ad,
+                            }
+                        },
+                        {
+                            "updateMask": "status",
+                            "update": {
+                                "resourceName": format!(
+                                    "customers/{customer_id}/adGroupAds/{ad_group_id}~{ad_id}"
+                                ),
+                                "status": "PAUSED",
+                            }
+                        }
+                    ],
+                    "partialFailure": false,
+                }),
+            )
+            .await?;
+        Ok(json!({ "mode": "applied", "plan": plan, "response": response }))
+    }
+
     pub async fn rebalance_budgets(
         &self,
         customer_id: Option<&str>,
@@ -1030,6 +1215,52 @@ fn json_u64(value: Option<&Value>, label: &str) -> Result<u64> {
     }
 }
 
+fn replaced_text_assets(
+    value: Option<&Value>,
+    replacements: &HashMap<&str, &str>,
+    max_chars: usize,
+    label: &str,
+    matched: &mut HashSet<String>,
+) -> Result<Vec<Value>> {
+    let assets = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Invalid(format!("RSA {label}s are missing")))?;
+    assets
+        .iter()
+        .map(|asset| {
+            let text = asset
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Invalid(format!("RSA {label} text is missing")))?;
+            let replacement = replacements.get(text).copied();
+            let text = replacement.unwrap_or(text);
+            if text.chars().count() > max_chars {
+                return Err(Error::Invalid(format!(
+                    "RSA {label} exceeds {max_chars} characters: {text}"
+                )));
+            }
+            if replacement.is_some() {
+                matched.insert(asset["text"].as_str().unwrap_or_default().to_string());
+            }
+            let mut result = json!({ "text": text });
+            if let Some(pinned_field) = asset.get("pinnedField").and_then(Value::as_str) {
+                result["pinnedField"] = json!(pinned_field);
+            }
+            Ok(result)
+        })
+        .collect()
+}
+
+fn copy_optional_string(source: &serde_json::Map<String, Value>, target: &mut Value, key: &str) {
+    if let Some(value) = source
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+    {
+        target[key] = json!(value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1137,5 +1368,38 @@ mod tests {
     fn bid_guard_rejects_large_or_baseless_increases() {
         assert!(validate_bid_increase(1_000_000, 1_250_001, 25).is_err());
         assert!(validate_bid_increase(0, 1, 25).is_err());
+    }
+
+    #[test]
+    fn rsa_replacement_preserves_pinning() {
+        let assets = json!([{
+            "text": "99.5% SLA on Every Plan",
+            "pinnedField": "HEADLINE_2",
+            "assetPerformanceLabel": "PENDING"
+        }]);
+        let replacements = HashMap::from([("99.5% SLA on Every Plan", "Built for Production")]);
+        let mut matched = HashSet::new();
+        let result =
+            replaced_text_assets(Some(&assets), &replacements, 30, "headline", &mut matched)
+                .unwrap();
+        assert_eq!(
+            result,
+            vec![json!({
+                "text": "Built for Production",
+                "pinnedField": "HEADLINE_2"
+            })]
+        );
+        assert!(matched.contains("99.5% SLA on Every Plan"));
+    }
+
+    #[test]
+    fn rsa_replacement_rejects_oversized_asset() {
+        let assets = json!([{ "text": "old" }]);
+        let replacements = HashMap::from([("old", "this headline is definitely too long")]);
+        let mut matched = HashSet::new();
+        assert!(
+            replaced_text_assets(Some(&assets), &replacements, 30, "headline", &mut matched)
+                .is_err()
+        );
     }
 }
