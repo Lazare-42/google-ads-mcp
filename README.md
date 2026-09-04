@@ -34,8 +34,12 @@ It supports stdio and Streamable HTTP (`/mcp`).
   emails, change-author emails, click-level identifiers (`click_view`), Local
   Services leads/conversations, verification artifacts, and hotel
   reconciliation records. This is a conservative denylist, not a general DLP
-  guarantee. OAuth and Google Ads error bodies are never copied into errors;
-  Ads errors retain only HTTP status and the opaque request ID.
+  guarantee. OAuth error bodies are never copied into errors. Google Ads errors
+  keep the HTTP status, the opaque request ID, and Google's own error codes and
+  messages (for example `queryError.UNRECOGNIZED_FIELD: Unrecognized fields in
+  the query: 'campaign.start_date'`). Those messages describe the caller's
+  request, not account data; `trigger` values and the raw body are dropped and
+  the detail is capped at 600 characters.
 - Confirmed-mutation logs contain customer/resource IDs, but not keyword text,
   credentials, tokens, or upstream response bodies.
 
@@ -62,6 +66,30 @@ Keep mutations disabled until `list_accessible_customers`, account reports,
 and preview results have all been checked against the Google Ads UI. Enabling
 mutations without an explicit `GOOGLE_ADS_ALLOWED_CUSTOMER_IDS` entry still
 leaves every write blocked.
+
+## Report output
+
+Every report tool returns one compact JSON object:
+
+```json
+{"customerId":"1234567890","currency":"EUR","startDate":"2026-09-01","endDate":"2026-09-04",
+ "rowCount":2,"limit":100,"columns":["campaign.id","campaign.name","metrics.costMicros"],
+ "rows":[["21638916637","Meeting Bots","240000"],["...","...","..."]]}
+```
+
+- `columns` are Google's camelCase field paths from the response `fieldMask`;
+  `rows` hold one value per column in the same order. Field names therefore
+  appear once per response instead of once per row, and `resourceName`
+  duplicates are dropped. In practice this is roughly an 8x smaller payload
+  than the nested pretty-printed response.
+- `*Micros` values are millionths of `currency`; int64 values arrive as strings.
+- `limitReached: true` appears when `rowCount` equals `limit`; `nextPageToken`
+  appears when Google paginated (`run_gaql` accepts it back as `page_token`).
+- Date-ranged reports accept `campaign_id` and/or `ad_group_id` filters (digits
+  only, injected as numeric literals) and `daily: true` for one row per entity
+  per day. `campaign_performance` and `geographic_performance` accept only the
+  campaign filter; `account_performance` and `conversion_performance` accept
+  only `daily`.
 
 ## Tools
 

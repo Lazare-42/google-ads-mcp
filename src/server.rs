@@ -6,7 +6,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::ads::{AdTextReplacement, BudgetAllocation, GoogleAdsClient};
+use crate::ads::{AdTextReplacement, BudgetAllocation, GoogleAdsClient, ReportFilter};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EmptyArgs {}
@@ -24,6 +24,9 @@ pub struct DateRangeArgs {
     pub start_date: String,
     /// Inclusive date in YYYY-MM-DD format.
     pub end_date: String,
+    /// True adds a segments.date column and returns one row per day.
+    #[serde(default)]
+    pub daily: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -33,6 +36,57 @@ pub struct LimitedDateRangeArgs {
     pub end_date: String,
     /// Maximum rows, 1..1000. Defaults to 100.
     pub limit: Option<u32>,
+}
+
+/// Date-ranged report that can be narrowed to one campaign and/or ad group.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReportArgs {
+    pub customer_id: Option<String>,
+    /// Inclusive date in YYYY-MM-DD format.
+    pub start_date: String,
+    /// Inclusive date in YYYY-MM-DD format.
+    pub end_date: String,
+    /// Maximum rows, 1..1000. Defaults to 100. limitReached=true means more rows exist.
+    pub limit: Option<u32>,
+    /// Optional numeric campaign ID; only rows in this campaign are returned.
+    pub campaign_id: Option<String>,
+    /// Optional numeric ad group ID; only rows in this ad group are returned.
+    pub ad_group_id: Option<String>,
+    /// True adds a segments.date column and returns one row per entity per day.
+    #[serde(default)]
+    pub daily: bool,
+}
+
+/// Campaign-level report: can be narrowed to one campaign, not to an ad group.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CampaignReportArgs {
+    pub customer_id: Option<String>,
+    /// Inclusive date in YYYY-MM-DD format.
+    pub start_date: String,
+    /// Inclusive date in YYYY-MM-DD format.
+    pub end_date: String,
+    /// Maximum rows, 1..1000. Defaults to 100. limitReached=true means more rows exist.
+    pub limit: Option<u32>,
+    /// Optional numeric campaign ID; only rows in this campaign are returned.
+    pub campaign_id: Option<String>,
+    /// True adds a segments.date column and returns one row per entity per day.
+    #[serde(default)]
+    pub daily: bool,
+}
+
+/// Account-wide report that supports a per-day breakdown but no entity filter.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DailyReportArgs {
+    pub customer_id: Option<String>,
+    /// Inclusive date in YYYY-MM-DD format.
+    pub start_date: String,
+    /// Inclusive date in YYYY-MM-DD format.
+    pub end_date: String,
+    /// Maximum rows, 1..1000. Defaults to 100.
+    pub limit: Option<u32>,
+    /// True adds a segments.date column and returns one row per day.
+    #[serde(default)]
+    pub daily: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -120,14 +174,28 @@ impl GoogleAdsServer {
         Self { client }
     }
 
+    /// Compact JSON: report payloads are columnar and can be large, and every
+    /// byte of indentation is paid for in model tokens.
     fn ok<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
-        let text = serde_json::to_string_pretty(value)
+        let text = serde_json::to_string(value)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     fn err(error: crate::error::Error) -> McpError {
         McpError::internal_error(error.to_string(), None)
+    }
+
+    fn filter(
+        campaign_id: Option<String>,
+        ad_group_id: Option<String>,
+        daily: bool,
+    ) -> ReportFilter {
+        ReportFilter {
+            campaign_id,
+            ad_group_id,
+            daily,
+        }
     }
 }
 
@@ -161,7 +229,7 @@ impl GoogleAdsServer {
     }
 
     #[tool(
-        description = "Account-level spend, clicks, impressions, and conversions for a date range.",
+        description = "Account totals: spend, clicks, impressions, conversions for a date range. Set daily=true for a per-day series.",
         annotations(read_only_hint = true)
     )]
     async fn account_performance(
@@ -174,6 +242,7 @@ impl GoogleAdsServer {
                 args.customer_id.as_deref(),
                 &args.start_date,
                 &args.end_date,
+                args.daily,
             )
             .await
             .map_err(Self::err)?;
@@ -181,13 +250,14 @@ impl GoogleAdsServer {
     }
 
     #[tool(
-        description = "Campaign spend and conversion performance, ordered by spend.",
+        description = "Campaign spend and conversion performance, ordered by spend. Filter by campaign_id; daily=true for per-day rows.",
         annotations(read_only_hint = true)
     )]
     async fn campaign_performance(
         &self,
-        Parameters(args): Parameters<LimitedDateRangeArgs>,
+        Parameters(args): Parameters<CampaignReportArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let filter = Self::filter(args.campaign_id, None, args.daily);
         let value = self
             .client
             .campaign_performance(
@@ -195,6 +265,7 @@ impl GoogleAdsServer {
                 &args.start_date,
                 &args.end_date,
                 args.limit.unwrap_or(100),
+                &filter,
             )
             .await
             .map_err(Self::err)?;
@@ -202,13 +273,14 @@ impl GoogleAdsServer {
     }
 
     #[tool(
-        description = "Ad-group spend, CPC, and conversion performance, ordered by spend.",
+        description = "Ad-group spend, CPC, and conversion performance, ordered by spend. Filter by campaign_id/ad_group_id; daily=true for per-day rows.",
         annotations(read_only_hint = true)
     )]
     async fn ad_group_performance(
         &self,
-        Parameters(args): Parameters<LimitedDateRangeArgs>,
+        Parameters(args): Parameters<ReportArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let filter = Self::filter(args.campaign_id, args.ad_group_id, args.daily);
         let value = self
             .client
             .ad_group_performance(
@@ -216,6 +288,7 @@ impl GoogleAdsServer {
                 &args.start_date,
                 &args.end_date,
                 args.limit.unwrap_or(100),
+                &filter,
             )
             .await
             .map_err(Self::err)?;
@@ -223,13 +296,14 @@ impl GoogleAdsServer {
     }
 
     #[tool(
-        description = "Ad-level spend and conversion performance with RSA headlines, descriptions, and final URLs.",
+        description = "Ad-level spend and conversion performance with RSA headlines, descriptions, and final URLs. Filter by campaign_id/ad_group_id.",
         annotations(read_only_hint = true)
     )]
     async fn ad_performance(
         &self,
-        Parameters(args): Parameters<LimitedDateRangeArgs>,
+        Parameters(args): Parameters<ReportArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let filter = Self::filter(args.campaign_id, args.ad_group_id, args.daily);
         let value = self
             .client
             .ad_performance(
@@ -237,6 +311,7 @@ impl GoogleAdsServer {
                 &args.start_date,
                 &args.end_date,
                 args.limit.unwrap_or(100),
+                &filter,
             )
             .await
             .map_err(Self::err)?;
@@ -244,13 +319,14 @@ impl GoogleAdsServer {
     }
 
     #[tool(
-        description = "Keyword performance with match type, quality score, effective CPC bid, spend, and conversions.",
+        description = "Keyword performance with match type, quality score, effective CPC bid, spend, and conversions. Filter by campaign_id/ad_group_id; daily=true for per-day rows.",
         annotations(read_only_hint = true)
     )]
     async fn keyword_performance(
         &self,
-        Parameters(args): Parameters<LimitedDateRangeArgs>,
+        Parameters(args): Parameters<ReportArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let filter = Self::filter(args.campaign_id, args.ad_group_id, args.daily);
         let value = self
             .client
             .keyword_performance(
@@ -258,6 +334,7 @@ impl GoogleAdsServer {
                 &args.start_date,
                 &args.end_date,
                 args.limit.unwrap_or(100),
+                &filter,
             )
             .await
             .map_err(Self::err)?;
@@ -287,13 +364,14 @@ impl GoogleAdsServer {
     }
 
     #[tool(
-        description = "Campaign performance by geographic location for country and presence/interest cleanup.",
+        description = "Campaign performance by geographic location for country and presence/interest cleanup. Filter by campaign_id.",
         annotations(read_only_hint = true)
     )]
     async fn geographic_performance(
         &self,
-        Parameters(args): Parameters<LimitedDateRangeArgs>,
+        Parameters(args): Parameters<CampaignReportArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let filter = Self::filter(args.campaign_id, None, args.daily);
         let value = self
             .client
             .geographic_performance(
@@ -301,6 +379,7 @@ impl GoogleAdsServer {
                 &args.start_date,
                 &args.end_date,
                 args.limit.unwrap_or(100),
+                &filter,
             )
             .await
             .map_err(Self::err)?;
@@ -308,13 +387,14 @@ impl GoogleAdsServer {
     }
 
     #[tool(
-        description = "Paid landing-page spend and conversion performance by final URL.",
+        description = "Paid landing-page spend and conversion performance by final URL. Filter by campaign_id/ad_group_id.",
         annotations(read_only_hint = true)
     )]
     async fn landing_page_performance(
         &self,
-        Parameters(args): Parameters<LimitedDateRangeArgs>,
+        Parameters(args): Parameters<ReportArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let filter = Self::filter(args.campaign_id, args.ad_group_id, args.daily);
         let value = self
             .client
             .landing_page_performance(
@@ -322,6 +402,7 @@ impl GoogleAdsServer {
                 &args.start_date,
                 &args.end_date,
                 args.limit.unwrap_or(100),
+                &filter,
             )
             .await
             .map_err(Self::err)?;
@@ -382,12 +463,12 @@ impl GoogleAdsServer {
     }
 
     #[tool(
-        description = "Conversion performance grouped by conversion action for a date range.",
+        description = "Conversions and conversion value grouped by conversion action for a date range (conversion metrics only; Google does not allow cost per action here). daily=true for per-day rows.",
         annotations(read_only_hint = true)
     )]
     async fn conversion_performance(
         &self,
-        Parameters(args): Parameters<LimitedDateRangeArgs>,
+        Parameters(args): Parameters<DailyReportArgs>,
     ) -> Result<CallToolResult, McpError> {
         let value = self
             .client
@@ -396,6 +477,7 @@ impl GoogleAdsServer {
                 &args.start_date,
                 &args.end_date,
                 args.limit.unwrap_or(100),
+                args.daily,
             )
             .await
             .map_err(Self::err)?;
@@ -403,13 +485,14 @@ impl GoogleAdsServer {
     }
 
     #[tool(
-        description = "Google Ads search terms with spend and conversions. Email/phone-like values are redacted best-effort; free text can still contain PII and must be treated as sensitive.",
+        description = "Google Ads search terms with spend and conversions; the only way to read search terms (run_gaql blocks them). Filter by campaign_id/ad_group_id; daily=true for per-day rows. Email/phone-like values are redacted best-effort; free text can still contain PII and must be treated as sensitive.",
         annotations(read_only_hint = true)
     )]
     async fn search_terms(
         &self,
-        Parameters(args): Parameters<LimitedDateRangeArgs>,
+        Parameters(args): Parameters<ReportArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let filter = Self::filter(args.campaign_id, args.ad_group_id, args.daily);
         let value = self
             .client
             .search_terms(
@@ -417,6 +500,7 @@ impl GoogleAdsServer {
                 &args.start_date,
                 &args.end_date,
                 args.limit.unwrap_or(100),
+                &filter,
             )
             .await
             .map_err(Self::err)?;
@@ -424,7 +508,7 @@ impl GoogleAdsServer {
     }
 
     #[tool(
-        description = "Run one arbitrary read-only GAQL SELECT query. Unredacted search terms, direct lead/user data, and click-level identifiers are blocked; no mutate endpoint is exposed.",
+        description = "Run one arbitrary read-only GAQL SELECT query when no report tool fits. Result is columns+rows keyed by Google field paths. Blocked: search_term_view (use search_terms), direct lead/user data, click-level identifiers. Google error codes and messages are returned so invalid fields can be corrected.",
         annotations(read_only_hint = true)
     )]
     async fn run_gaql(
@@ -557,7 +641,10 @@ impl ServerHandler for GoogleAdsServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(implementation)
             .with_instructions(
-                "Google Ads reporting and guarded optimization for Meeting BaaS. Read first, then preview mutations with confirm=false. Apply only after reviewing the preview and setting confirm=true. Mutations also require a server-side enable flag and explicit customer allowlist. Keyword bid increases are capped against the current Google Ads value. Budget rebalances are atomic, limited to DAILY budgets, and rejected when the requested sum exceeds the current sum. RSA text replacement fetches one known enabled ad, requires exact source text, preserves its URL configuration, then atomically creates the corrected RSA and pauses only that selected ad. Search-term email/phone-like values are redacted best-effort, but all report output remains sensitive. Raw GAQL blocks direct lead/user data, unredacted search terms, and click-level identifiers. No unrestricted mutate, campaign removal, arbitrary ad creation, or conversion deletion tool exists.",
+                "Google Ads reporting and guarded optimization for Meeting BaaS. \
+                 OUTPUT: every report returns compact JSON {customerId, currency, startDate, endDate, rowCount, limit, limitReached?, nextPageToken?, columns, rows}; columns are Google field paths (e.g. metrics.costMicros) and each row is an array of values in column order. All *Micros values are millionths of the account currency (1,000,000 micros = 1.00). Int64 values arrive as strings. \
+                 ROUTING: prefer the named report tools; they accept campaign_id/ad_group_id filters and daily=true for per-day rows. Use conversion_performance for conversions by action, search_terms for search terms (run_gaql rejects search_term_view), and run_gaql only for fields no report exposes. When a query is invalid the error carries Google's error code and message (e.g. queryError.UNRECOGNIZED_FIELD with the offending field names); fix the query instead of retrying unchanged. \
+                 WRITES: read first, then preview mutations with confirm=false. Apply only after reviewing the preview and setting confirm=true. Mutations also require a server-side enable flag and explicit customer allowlist. Keyword bid increases are capped against the current Google Ads value. Budget rebalances are atomic, limited to DAILY budgets, and rejected when the requested sum exceeds the current sum. RSA text replacement fetches one known enabled ad, requires exact source text, preserves its URL configuration, then atomically creates the corrected RSA and pauses only that selected ad. Search-term email/phone-like values are redacted best-effort, but all report output remains sensitive. No unrestricted mutate, campaign removal, arbitrary ad creation, or conversion deletion tool exists.",
             )
     }
 }

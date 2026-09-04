@@ -6,7 +6,8 @@ use std::{
 
 use reqwest::{Client, Method, RequestBuilder};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use tokio::sync::RwLock;
 
 use crate::{
     auth::GoogleAuth,
@@ -15,6 +16,8 @@ use crate::{
 
 const DEFAULT_API_VERSION: &str = "v25";
 const MAX_MICROS: u64 = i64::MAX as u64;
+const MAX_ERROR_DETAIL_CHARS: usize = 600;
+const SEARCH_TERM_COLUMN: &str = "searchTermView.searchTerm";
 const SENSITIVE_GAQL_FRAGMENTS: &[&str] = &[
     "customer_user_access",
     "customer_user_access_invitation",
@@ -63,6 +66,40 @@ pub struct AdTextReplacement {
     pub from: String,
     /// New headline (maximum 30 characters) or description (maximum 90 characters).
     pub to: String,
+}
+
+/// Optional narrowing applied to report queries. IDs are validated as digits and
+/// injected as numeric literals, never as free text.
+#[derive(Debug, Clone, Default)]
+pub struct ReportFilter {
+    pub campaign_id: Option<String>,
+    pub ad_group_id: Option<String>,
+    pub daily: bool,
+}
+
+/// Columnar rendering of a Google Ads search response: `columns` are the
+/// camelCase field paths from Google's `fieldMask`, `rows` hold one value per
+/// column. This keeps every field name once instead of once per row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Table {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReportMeta<'a> {
+    start_date: Option<&'a str>,
+    end_date: Option<&'a str>,
+    limit: Option<u32>,
+}
+
+struct ReportQuery<'a> {
+    select: &'a str,
+    from: &'a str,
+    conditions: Vec<String>,
+    order_by: Option<&'a str>,
+    limit: u32,
+    filter: &'a ReportFilter,
 }
 
 impl AdsConfig {
@@ -207,6 +244,190 @@ fn validate_gaql_privacy(query: &str) -> Result<()> {
     Ok(())
 }
 
+/// Extract only Google Ads error codes, messages, and field paths from an error
+/// body. These echo the caller's own request (GAQL field names, operation
+/// fields), which the calling model needs to self-correct. The generic
+/// top-level message, `trigger` values, and the raw body are never returned.
+fn extract_api_error_detail(body: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    let details = parsed.get("error")?.get("details")?.as_array()?;
+    let mut parts = Vec::new();
+    for detail in details {
+        let Some(errors) = detail.get("errors").and_then(Value::as_array) else {
+            continue;
+        };
+        for error in errors {
+            let code = error
+                .get("errorCode")
+                .and_then(Value::as_object)
+                .and_then(|codes| codes.iter().next())
+                .map(|(kind, value)| format!("{kind}.{}", value.as_str().unwrap_or("UNKNOWN")))
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(sanitize_message)
+                .unwrap_or_default();
+            let path = error
+                .get("location")
+                .and_then(|location| location.get("fieldPathElements"))
+                .and_then(Value::as_array)
+                .map(|elements| {
+                    elements
+                        .iter()
+                        .filter_map(|element| {
+                            let name = element.get("fieldName")?.as_str()?;
+                            Some(match element.get("index").and_then(Value::as_u64) {
+                                Some(index) => format!("{name}[{index}]"),
+                                None => name.to_string(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(".")
+                })
+                .filter(|path| !path.is_empty());
+            let mut part = code;
+            if !message.is_empty() {
+                part.push_str(": ");
+                part.push_str(&message);
+            }
+            if let Some(path) = path {
+                part.push_str(" (at ");
+                part.push_str(&path);
+                part.push(')');
+            }
+            parts.push(part);
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut detail = parts.join("; ");
+    if detail.chars().count() > MAX_ERROR_DETAIL_CHARS {
+        detail = detail.chars().take(MAX_ERROR_DETAIL_CHARS).collect();
+        detail.push('…');
+    }
+    Some(detail)
+}
+
+fn sanitize_message(value: &str) -> String {
+    value
+        .split(|c: char| c.is_control())
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn lookup_path<'a>(row: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('.').try_fold(row, |value, key| value.get(key))
+}
+
+/// Convert Google's `{fieldMask, results: [{resource: {field: ..}}]}` shape into
+/// columns and rows. Missing values become null so every row has one cell per
+/// column. `resourceName` entries are not part of `fieldMask` and are dropped.
+fn tabulate(response: &Value) -> Table {
+    let columns = response
+        .get("fieldMask")
+        .and_then(Value::as_str)
+        .map(|mask| {
+            mask.split(',')
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let rows = response
+        .get("results")
+        .and_then(Value::as_array)
+        .map(|results| {
+            results
+                .iter()
+                .map(|row| {
+                    columns
+                        .iter()
+                        .map(|column| lookup_path(row, column).cloned().unwrap_or(Value::Null))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Table { columns, rows }
+}
+
+fn build_report_query(query: ReportQuery<'_>) -> Result<String> {
+    let ReportQuery {
+        select,
+        from,
+        mut conditions,
+        order_by,
+        limit,
+        filter,
+    } = query;
+    let limit = validate_limit(limit)?;
+    // Google requires a filtered attributed-resource field (campaign.id,
+    // ad_group.id) to also appear in SELECT for views such as landing_page_view
+    // (EXPECTED_REFERENCED_FIELD_IN_SELECT_CLAUSE), so add it when missing.
+    let mut select = select.to_string();
+    if let Some(campaign_id) = filter.campaign_id.as_deref() {
+        let campaign_id = numeric_id(campaign_id, "campaign_id")?;
+        conditions.push(format!("campaign.id = {campaign_id}"));
+        if !selects_field(&select, "campaign.id") {
+            select = format!("campaign.id, {select}");
+        }
+    }
+    if let Some(ad_group_id) = filter.ad_group_id.as_deref() {
+        let ad_group_id = numeric_id(ad_group_id, "ad_group_id")?;
+        conditions.push(format!("ad_group.id = {ad_group_id}"));
+        if !selects_field(&select, "ad_group.id") {
+            select = format!("ad_group.id, {select}");
+        }
+    }
+    if filter.daily {
+        select = format!("segments.date, {select}");
+    }
+    let mut sql = format!("SELECT {select} FROM {from}");
+    if !conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conditions.join(" AND "));
+    }
+    let mut order = Vec::new();
+    if filter.daily {
+        order.push("segments.date");
+    }
+    if let Some(order_by) = order_by {
+        order.push(order_by);
+    }
+    if !order.is_empty() {
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&order.join(", "));
+    }
+    sql.push_str(&format!(" LIMIT {limit}"));
+    Ok(sql)
+}
+
+fn selects_field(select: &str, field: &str) -> bool {
+    select
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == field)
+}
+
+fn dated<'a>(start_date: &'a str, end_date: &'a str, limit: Option<u32>) -> ReportMeta<'a> {
+    ReportMeta {
+        start_date: Some(start_date),
+        end_date: Some(end_date),
+        limit,
+    }
+}
+
+fn date_condition(start_date: &str, end_date: &str) -> Result<String> {
+    validate_date_range(start_date, end_date)?;
+    Ok(format!(
+        "segments.date BETWEEN '{start_date}' AND '{end_date}'"
+    ))
+}
+
 fn contains_email_like(value: &str) -> bool {
     fn local_byte(byte: u8) -> bool {
         byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'%' | b'+' | b'-')
@@ -265,25 +486,25 @@ fn contains_phone_or_long_id(value: &str) -> bool {
     digits >= 7
 }
 
-fn redact_search_term_pii(mut response: Value) -> Value {
-    let Some(rows) = response.get_mut("results").and_then(Value::as_array_mut) else {
-        return response;
+fn redact_search_term_pii(table: &mut Table) {
+    let Some(index) = table
+        .columns
+        .iter()
+        .position(|column| column == SEARCH_TERM_COLUMN)
+    else {
+        return;
     };
-    for row in rows {
-        let Some(search_term) = row
-            .get_mut("searchTermView")
-            .and_then(|view| view.get_mut("searchTerm"))
-        else {
+    for row in &mut table.rows {
+        let Some(cell) = row.get_mut(index) else {
             continue;
         };
-        let should_redact = search_term
+        let should_redact = cell
             .as_str()
             .is_some_and(|term| contains_email_like(term) || contains_phone_or_long_id(term));
         if should_redact {
-            *search_term = Value::String("[REDACTED_POTENTIAL_PII]".into());
+            *cell = Value::String("[REDACTED_POTENTIAL_PII]".into());
         }
     }
-    response
 }
 
 fn segment_field(breakdown: &str) -> Result<&'static str> {
@@ -324,6 +545,9 @@ pub struct GoogleAdsClient {
     auth: Arc<GoogleAuth>,
     http: Client,
     config: AdsConfig,
+    /// Customer ID -> currency code. Currency is stable per account, so one
+    /// lookup per process is enough to label every report.
+    currency_cache: RwLock<HashMap<String, String>>,
 }
 
 impl GoogleAdsClient {
@@ -332,7 +556,12 @@ impl GoogleAdsClient {
             .user_agent(concat!("google-ads-mcp/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(30))
             .build()?;
-        Ok(Self { auth, http, config })
+        Ok(Self {
+            auth,
+            http,
+            config,
+            currency_cache: RwLock::new(HashMap::new()),
+        })
     }
 
     pub fn setup_status(&self) -> SetupStatus {
@@ -385,9 +614,19 @@ impl GoogleAdsClient {
             .unwrap_or("unavailable")
             .to_string();
         if !status.is_success() {
-            // Google error details can echo caller-provided GAQL literals or
-            // mutation data. Keep only the opaque support ID in MCP errors.
-            return Err(Error::Api { status, request_id });
+            // Keep Google's error codes and messages (they describe the caller's
+            // own request, e.g. "Unrecognized fields in the query: ...") so the
+            // calling model can self-correct. The raw body is never forwarded.
+            let detail = response
+                .text()
+                .await
+                .ok()
+                .and_then(|body| extract_api_error_detail(&body));
+            return Err(Error::Api {
+                status,
+                request_id,
+                detail,
+            });
         }
         let body = response.text().await?;
         Ok(serde_json::from_str(&body)?)
@@ -432,6 +671,95 @@ impl GoogleAdsClient {
         self.response_json(request.send().await?).await
     }
 
+    /// Best-effort currency label. Failure here must not fail a report whose
+    /// main query already succeeded.
+    async fn currency(&self, customer_id: &str) -> Option<String> {
+        if let Some(currency) = self.currency_cache.read().await.get(customer_id) {
+            return Some(currency.clone());
+        }
+        let response = self
+            .search(
+                Some(customer_id),
+                "SELECT customer.currency_code FROM customer LIMIT 1",
+                None,
+            )
+            .await
+            .ok()?;
+        let currency = response
+            .get("results")?
+            .as_array()?
+            .first()?
+            .get("customer")?
+            .get("currencyCode")?
+            .as_str()?
+            .to_string();
+        self.currency_cache
+            .write()
+            .await
+            .insert(customer_id.to_string(), currency.clone());
+        Some(currency)
+    }
+
+    /// Run a read query and return it as columns/rows plus Google's page token.
+    async fn report_table(
+        &self,
+        customer_id: &str,
+        query: &str,
+        page_token: Option<&str>,
+    ) -> Result<(Table, Option<String>)> {
+        let response = self.search(Some(customer_id), query, page_token).await?;
+        let next_page_token = response
+            .get("nextPageToken")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        Ok((tabulate(&response), next_page_token))
+    }
+
+    async fn render_report(
+        &self,
+        customer_id: &str,
+        meta: ReportMeta<'_>,
+        table: Table,
+        next_page_token: Option<String>,
+    ) -> Value {
+        let mut out = Map::new();
+        out.insert("customerId".into(), json!(customer_id));
+        out.insert("currency".into(), json!(self.currency(customer_id).await));
+        if let Some(start_date) = meta.start_date {
+            out.insert("startDate".into(), json!(start_date));
+        }
+        if let Some(end_date) = meta.end_date {
+            out.insert("endDate".into(), json!(end_date));
+        }
+        out.insert("rowCount".into(), json!(table.rows.len()));
+        if let Some(limit) = meta.limit {
+            out.insert("limit".into(), json!(limit));
+            if table.rows.len() >= limit as usize {
+                out.insert("limitReached".into(), json!(true));
+            }
+        }
+        if let Some(token) = next_page_token {
+            out.insert("nextPageToken".into(), json!(token));
+        }
+        out.insert("columns".into(), json!(table.columns));
+        out.insert("rows".into(), json!(table.rows));
+        Value::Object(out)
+    }
+
+    async fn report(
+        &self,
+        customer_id: Option<&str>,
+        query: &str,
+        meta: ReportMeta<'_>,
+    ) -> Result<Value> {
+        let customer_id = self.customer_id(customer_id)?;
+        let (table, next_page_token) = self.report_table(&customer_id, query, None).await?;
+        Ok(self
+            .render_report(&customer_id, meta, table, next_page_token)
+            .await)
+    }
+
     pub async fn run_gaql(
         &self,
         customer_id: Option<&str>,
@@ -439,7 +767,11 @@ impl GoogleAdsClient {
         page_token: Option<&str>,
     ) -> Result<Value> {
         validate_gaql_privacy(query)?;
-        self.search(customer_id, query, page_token).await
+        let customer_id = self.customer_id(customer_id)?;
+        let (table, next_page_token) = self.report_table(&customer_id, query, page_token).await?;
+        Ok(self
+            .render_report(&customer_id, ReportMeta::default(), table, next_page_token)
+            .await)
     }
 
     pub async fn account_performance(
@@ -447,15 +779,25 @@ impl GoogleAdsClient {
         customer_id: Option<&str>,
         start_date: &str,
         end_date: &str,
+        daily: bool,
     ) -> Result<Value> {
-        validate_date_range(start_date, end_date)?;
-        let query = format!(
-            "SELECT customer.id, customer.descriptive_name, customer.currency_code, \
-             customer.time_zone, metrics.impressions, metrics.clicks, metrics.cost_micros, \
-             metrics.conversions, metrics.conversions_value, metrics.all_conversions \
-             FROM customer WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'"
-        );
-        self.search(customer_id, &query, None).await
+        let filter = ReportFilter {
+            daily,
+            ..ReportFilter::default()
+        };
+        let query = build_report_query(ReportQuery {
+            select: "customer.id, customer.descriptive_name, customer.currency_code, \
+                     customer.time_zone, metrics.impressions, metrics.clicks, \
+                     metrics.cost_micros, metrics.conversions, metrics.conversions_value, \
+                     metrics.all_conversions",
+            from: "customer",
+            conditions: vec![date_condition(start_date, end_date)?],
+            order_by: None,
+            limit: 1000,
+            filter: &filter,
+        })?;
+        self.report(customer_id, &query, dated(start_date, end_date, None))
+            .await
     }
 
     pub async fn campaign_performance(
@@ -464,18 +806,26 @@ impl GoogleAdsClient {
         start_date: &str,
         end_date: &str,
         limit: u32,
+        filter: &ReportFilter,
     ) -> Result<Value> {
-        validate_date_range(start_date, end_date)?;
-        let limit = validate_limit(limit)?;
-        let query = format!(
-            "SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type, \
-             campaign.campaign_budget, metrics.impressions, metrics.clicks, metrics.ctr, \
-             metrics.average_cpc, metrics.cost_micros, metrics.conversions, \
-             metrics.conversions_value, metrics.cost_per_conversion \
-             FROM campaign WHERE segments.date BETWEEN '{start_date}' AND '{end_date}' \
-             ORDER BY metrics.cost_micros DESC LIMIT {limit}"
-        );
-        self.search(customer_id, &query, None).await
+        let query = build_report_query(ReportQuery {
+            select: "campaign.id, campaign.name, campaign.status, \
+                     campaign.advertising_channel_type, campaign.campaign_budget, \
+                     metrics.impressions, metrics.clicks, metrics.ctr, metrics.average_cpc, \
+                     metrics.cost_micros, metrics.conversions, metrics.conversions_value, \
+                     metrics.cost_per_conversion",
+            from: "campaign",
+            conditions: vec![date_condition(start_date, end_date)?],
+            order_by: Some("metrics.cost_micros DESC"),
+            limit,
+            filter,
+        })?;
+        self.report(
+            customer_id,
+            &query,
+            dated(start_date, end_date, Some(limit)),
+        )
+        .await
     }
 
     pub async fn ad_group_performance(
@@ -484,18 +834,26 @@ impl GoogleAdsClient {
         start_date: &str,
         end_date: &str,
         limit: u32,
+        filter: &ReportFilter,
     ) -> Result<Value> {
-        validate_date_range(start_date, end_date)?;
-        let limit = validate_limit(limit)?;
-        let query = format!(
-            "SELECT campaign.id, campaign.name, ad_group.id, ad_group.name, ad_group.status, \
-             ad_group.type, ad_group.cpc_bid_micros, metrics.impressions, metrics.clicks, \
-             metrics.ctr, metrics.average_cpc, metrics.cost_micros, metrics.conversions, \
-             metrics.conversions_value, metrics.cost_per_conversion \
-             FROM ad_group WHERE segments.date BETWEEN '{start_date}' AND '{end_date}' \
-             ORDER BY metrics.cost_micros DESC LIMIT {limit}"
-        );
-        self.search(customer_id, &query, None).await
+        let query = build_report_query(ReportQuery {
+            select: "campaign.id, campaign.name, ad_group.id, ad_group.name, ad_group.status, \
+                     ad_group.type, ad_group.cpc_bid_micros, metrics.impressions, \
+                     metrics.clicks, metrics.ctr, metrics.average_cpc, metrics.cost_micros, \
+                     metrics.conversions, metrics.conversions_value, \
+                     metrics.cost_per_conversion",
+            from: "ad_group",
+            conditions: vec![date_condition(start_date, end_date)?],
+            order_by: Some("metrics.cost_micros DESC"),
+            limit,
+            filter,
+        })?;
+        self.report(
+            customer_id,
+            &query,
+            dated(start_date, end_date, Some(limit)),
+        )
+        .await
     }
 
     pub async fn ad_performance(
@@ -504,21 +862,31 @@ impl GoogleAdsClient {
         start_date: &str,
         end_date: &str,
         limit: u32,
+        filter: &ReportFilter,
     ) -> Result<Value> {
-        validate_date_range(start_date, end_date)?;
-        let limit = validate_limit(limit)?;
-        let query = format!(
-            "SELECT campaign.id, campaign.name, ad_group.id, ad_group.name, \
-             ad_group_ad.ad.id, ad_group_ad.ad.type, ad_group_ad.status, \
-             ad_group_ad.ad.final_urls, ad_group_ad.ad.responsive_search_ad.headlines, \
-             ad_group_ad.ad.responsive_search_ad.descriptions, metrics.impressions, \
-             metrics.clicks, metrics.ctr, metrics.average_cpc, metrics.cost_micros, \
-             metrics.conversions, metrics.conversions_value, metrics.cost_per_conversion \
-             FROM ad_group_ad WHERE ad_group_ad.status != 'REMOVED' \
-             AND segments.date BETWEEN '{start_date}' AND '{end_date}' \
-             ORDER BY metrics.cost_micros DESC LIMIT {limit}"
-        );
-        self.search(customer_id, &query, None).await
+        let query = build_report_query(ReportQuery {
+            select: "campaign.id, campaign.name, ad_group.id, ad_group.name, \
+                     ad_group_ad.ad.id, ad_group_ad.ad.type, ad_group_ad.status, \
+                     ad_group_ad.ad.final_urls, ad_group_ad.ad.responsive_search_ad.headlines, \
+                     ad_group_ad.ad.responsive_search_ad.descriptions, metrics.impressions, \
+                     metrics.clicks, metrics.ctr, metrics.average_cpc, metrics.cost_micros, \
+                     metrics.conversions, metrics.conversions_value, \
+                     metrics.cost_per_conversion",
+            from: "ad_group_ad",
+            conditions: vec![
+                "ad_group_ad.status != 'REMOVED'".to_string(),
+                date_condition(start_date, end_date)?,
+            ],
+            order_by: Some("metrics.cost_micros DESC"),
+            limit,
+            filter,
+        })?;
+        self.report(
+            customer_id,
+            &query,
+            dated(start_date, end_date, Some(limit)),
+        )
+        .await
     }
 
     pub async fn keyword_performance(
@@ -527,22 +895,32 @@ impl GoogleAdsClient {
         start_date: &str,
         end_date: &str,
         limit: u32,
+        filter: &ReportFilter,
     ) -> Result<Value> {
-        validate_date_range(start_date, end_date)?;
-        let limit = validate_limit(limit)?;
-        let query = format!(
-            "SELECT campaign.id, campaign.name, ad_group.id, ad_group.name, \
-             ad_group_criterion.criterion_id, ad_group_criterion.status, \
-             ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, \
-             ad_group_criterion.quality_info.quality_score, \
-             ad_group_criterion.effective_cpc_bid_micros, metrics.impressions, \
-             metrics.clicks, metrics.ctr, metrics.average_cpc, metrics.cost_micros, \
-             metrics.conversions, metrics.conversions_value, metrics.cost_per_conversion \
-             FROM keyword_view WHERE ad_group_criterion.status != 'REMOVED' \
-             AND segments.date BETWEEN '{start_date}' AND '{end_date}' \
-             ORDER BY metrics.cost_micros DESC LIMIT {limit}"
-        );
-        self.search(customer_id, &query, None).await
+        let query = build_report_query(ReportQuery {
+            select: "campaign.id, campaign.name, ad_group.id, ad_group.name, \
+                     ad_group_criterion.criterion_id, ad_group_criterion.status, \
+                     ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, \
+                     ad_group_criterion.quality_info.quality_score, \
+                     ad_group_criterion.effective_cpc_bid_micros, metrics.impressions, \
+                     metrics.clicks, metrics.ctr, metrics.average_cpc, metrics.cost_micros, \
+                     metrics.conversions, metrics.conversions_value, \
+                     metrics.cost_per_conversion",
+            from: "keyword_view",
+            conditions: vec![
+                "ad_group_criterion.status != 'REMOVED'".to_string(),
+                date_condition(start_date, end_date)?,
+            ],
+            order_by: Some("metrics.cost_micros DESC"),
+            limit,
+            filter,
+        })?;
+        self.report(
+            customer_id,
+            &query,
+            dated(start_date, end_date, Some(limit)),
+        )
+        .await
     }
 
     pub async fn traffic_segment_performance(
@@ -553,17 +931,26 @@ impl GoogleAdsClient {
         breakdown: &str,
         limit: u32,
     ) -> Result<Value> {
-        validate_date_range(start_date, end_date)?;
-        let limit = validate_limit(limit)?;
         let segment = segment_field(breakdown)?;
-        let query = format!(
-            "SELECT {segment}, metrics.impressions, metrics.clicks, metrics.ctr, \
+        let select = format!(
+            "{segment}, metrics.impressions, metrics.clicks, metrics.ctr, \
              metrics.average_cpc, metrics.cost_micros, metrics.conversions, \
-             metrics.conversions_value, metrics.cost_per_conversion \
-             FROM customer WHERE segments.date BETWEEN '{start_date}' AND '{end_date}' \
-             ORDER BY metrics.cost_micros DESC LIMIT {limit}"
+             metrics.conversions_value, metrics.cost_per_conversion"
         );
-        self.search(customer_id, &query, None).await
+        let query = build_report_query(ReportQuery {
+            select: &select,
+            from: "customer",
+            conditions: vec![date_condition(start_date, end_date)?],
+            order_by: Some("metrics.cost_micros DESC"),
+            limit,
+            filter: &ReportFilter::default(),
+        })?;
+        self.report(
+            customer_id,
+            &query,
+            dated(start_date, end_date, Some(limit)),
+        )
+        .await
     }
 
     pub async fn geographic_performance(
@@ -572,18 +959,26 @@ impl GoogleAdsClient {
         start_date: &str,
         end_date: &str,
         limit: u32,
+        filter: &ReportFilter,
     ) -> Result<Value> {
-        validate_date_range(start_date, end_date)?;
-        let limit = validate_limit(limit)?;
-        let query = format!(
-            "SELECT campaign.id, campaign.name, geographic_view.country_criterion_id, \
-             geographic_view.location_type, metrics.impressions, metrics.clicks, metrics.ctr, \
-             metrics.average_cpc, metrics.cost_micros, metrics.conversions, \
-             metrics.conversions_value, metrics.cost_per_conversion \
-             FROM geographic_view WHERE segments.date BETWEEN '{start_date}' AND '{end_date}' \
-             ORDER BY metrics.cost_micros DESC LIMIT {limit}"
-        );
-        self.search(customer_id, &query, None).await
+        let query = build_report_query(ReportQuery {
+            select: "campaign.id, campaign.name, geographic_view.country_criterion_id, \
+                     geographic_view.location_type, metrics.impressions, metrics.clicks, \
+                     metrics.ctr, metrics.average_cpc, metrics.cost_micros, \
+                     metrics.conversions, metrics.conversions_value, \
+                     metrics.cost_per_conversion",
+            from: "geographic_view",
+            conditions: vec![date_condition(start_date, end_date)?],
+            order_by: Some("metrics.cost_micros DESC"),
+            limit,
+            filter,
+        })?;
+        self.report(
+            customer_id,
+            &query,
+            dated(start_date, end_date, Some(limit)),
+        )
+        .await
     }
 
     pub async fn landing_page_performance(
@@ -592,17 +987,25 @@ impl GoogleAdsClient {
         start_date: &str,
         end_date: &str,
         limit: u32,
+        filter: &ReportFilter,
     ) -> Result<Value> {
-        validate_date_range(start_date, end_date)?;
-        let limit = validate_limit(limit)?;
-        let query = format!(
-            "SELECT landing_page_view.unexpanded_final_url, metrics.impressions, \
-             metrics.clicks, metrics.ctr, metrics.average_cpc, metrics.cost_micros, \
-             metrics.conversions, metrics.conversions_value, metrics.cost_per_conversion \
-             FROM landing_page_view WHERE segments.date BETWEEN '{start_date}' AND '{end_date}' \
-             ORDER BY metrics.cost_micros DESC LIMIT {limit}"
-        );
-        self.search(customer_id, &query, None).await
+        let query = build_report_query(ReportQuery {
+            select: "landing_page_view.unexpanded_final_url, metrics.impressions, \
+                     metrics.clicks, metrics.ctr, metrics.average_cpc, metrics.cost_micros, \
+                     metrics.conversions, metrics.conversions_value, \
+                     metrics.cost_per_conversion",
+            from: "landing_page_view",
+            conditions: vec![date_condition(start_date, end_date)?],
+            order_by: Some("metrics.cost_micros DESC"),
+            limit,
+            filter,
+        })?;
+        self.report(
+            customer_id,
+            &query,
+            dated(start_date, end_date, Some(limit)),
+        )
+        .await
     }
 
     pub async fn change_history(
@@ -613,30 +1016,62 @@ impl GoogleAdsClient {
         limit: u32,
     ) -> Result<Value> {
         validate_date_range(start_date, end_date)?;
-        let limit = validate_limit(limit)?;
-        let query = format!(
-            "SELECT change_event.change_date_time, change_event.change_resource_type, \
-             change_event.change_resource_name, change_event.client_type, \
-             change_event.changed_fields FROM change_event \
-             WHERE change_event.change_date_time BETWEEN '{start_date} 00:00:00' \
-             AND '{end_date} 23:59:59' ORDER BY change_event.change_date_time DESC LIMIT {limit}"
-        );
-        self.search(customer_id, &query, None).await
+        let query = build_report_query(ReportQuery {
+            select: "change_event.change_date_time, change_event.change_resource_type, \
+                     change_event.change_resource_name, change_event.client_type, \
+                     change_event.changed_fields",
+            from: "change_event",
+            conditions: vec![format!(
+                "change_event.change_date_time BETWEEN '{start_date} 00:00:00' \
+                 AND '{end_date} 23:59:59'"
+            )],
+            order_by: Some("change_event.change_date_time DESC"),
+            limit,
+            filter: &ReportFilter::default(),
+        })?;
+        self.report(
+            customer_id,
+            &query,
+            dated(start_date, end_date, Some(limit)),
+        )
+        .await
     }
 
     pub async fn recommendations(&self, customer_id: Option<&str>) -> Result<Value> {
-        let query = "SELECT recommendation.type, recommendation.impact, \
-                     recommendation.campaign, recommendation.resource_name \
-                     FROM recommendation WHERE recommendation.dismissed = FALSE LIMIT 100";
-        self.search(customer_id, query, None).await
+        let query = build_report_query(ReportQuery {
+            select: "recommendation.type, recommendation.impact, recommendation.campaign, \
+                     recommendation.resource_name",
+            from: "recommendation",
+            conditions: vec!["recommendation.dismissed = FALSE".to_string()],
+            order_by: None,
+            limit: 100,
+            filter: &ReportFilter::default(),
+        })?;
+        self.report(
+            customer_id,
+            &query,
+            ReportMeta {
+                limit: Some(100),
+                ..ReportMeta::default()
+            },
+        )
+        .await
     }
 
     pub async fn conversion_actions(&self, customer_id: Option<&str>) -> Result<Value> {
-        let query = "SELECT conversion_action.id, conversion_action.name, conversion_action.status, \
+        let query = build_report_query(ReportQuery {
+            select: "conversion_action.id, conversion_action.name, conversion_action.status, \
                      conversion_action.type, conversion_action.category, \
-                     conversion_action.primary_for_goal, conversion_action.include_in_conversions_metric \
-                     FROM conversion_action ORDER BY conversion_action.name";
-        self.search(customer_id, query, None).await
+                     conversion_action.primary_for_goal, \
+                     conversion_action.include_in_conversions_metric",
+            from: "conversion_action",
+            conditions: Vec::new(),
+            order_by: Some("conversion_action.name"),
+            limit: 1000,
+            filter: &ReportFilter::default(),
+        })?;
+        self.report(customer_id, &query, ReportMeta::default())
+            .await
     }
 
     pub async fn conversion_performance(
@@ -645,17 +1080,31 @@ impl GoogleAdsClient {
         start_date: &str,
         end_date: &str,
         limit: u32,
+        daily: bool,
     ) -> Result<Value> {
-        validate_date_range(start_date, end_date)?;
-        let limit = validate_limit(limit)?;
-        let query = format!(
-            "SELECT segments.conversion_action_name, segments.conversion_action_category, \
-             metrics.conversions, metrics.conversions_value, metrics.all_conversions, \
-             metrics.cost_per_conversion FROM customer \
-             WHERE segments.date BETWEEN '{start_date}' AND '{end_date}' \
-             ORDER BY metrics.conversions DESC LIMIT {limit}"
-        );
-        self.search(customer_id, &query, None).await
+        // Conversion segments only permit conversion metrics. Cost-derived
+        // metrics such as cost_per_conversion make Google reject the query with
+        // PROHIBITED_SEGMENT_WITH_METRIC_IN_SELECT_OR_WHERE_CLAUSE.
+        let filter = ReportFilter {
+            daily,
+            ..ReportFilter::default()
+        };
+        let query = build_report_query(ReportQuery {
+            select: "segments.conversion_action_name, segments.conversion_action_category, \
+                     metrics.conversions, metrics.conversions_value, metrics.all_conversions, \
+                     metrics.all_conversions_value",
+            from: "customer",
+            conditions: vec![date_condition(start_date, end_date)?],
+            order_by: Some("metrics.conversions DESC"),
+            limit,
+            filter: &filter,
+        })?;
+        self.report(
+            customer_id,
+            &query,
+            dated(start_date, end_date, Some(limit)),
+        )
+        .await
     }
 
     pub async fn search_terms(
@@ -664,18 +1113,30 @@ impl GoogleAdsClient {
         start_date: &str,
         end_date: &str,
         limit: u32,
+        filter: &ReportFilter,
     ) -> Result<Value> {
-        validate_date_range(start_date, end_date)?;
-        let limit = validate_limit(limit)?;
-        let query = format!(
-            "SELECT search_term_view.search_term, search_term_view.status, campaign.id, \
-             campaign.name, ad_group.id, ad_group.name, metrics.impressions, metrics.clicks, \
-             metrics.cost_micros, metrics.conversions, metrics.conversions_value \
-             FROM search_term_view WHERE segments.date BETWEEN '{start_date}' AND '{end_date}' \
-             ORDER BY metrics.cost_micros DESC LIMIT {limit}"
-        );
-        let response = self.search(customer_id, &query, None).await?;
-        Ok(redact_search_term_pii(response))
+        let query = build_report_query(ReportQuery {
+            select: "search_term_view.search_term, search_term_view.status, campaign.id, \
+                     campaign.name, ad_group.id, ad_group.name, metrics.impressions, \
+                     metrics.clicks, metrics.cost_micros, metrics.conversions, \
+                     metrics.conversions_value",
+            from: "search_term_view",
+            conditions: vec![date_condition(start_date, end_date)?],
+            order_by: Some("metrics.cost_micros DESC"),
+            limit,
+            filter,
+        })?;
+        let customer_id = self.customer_id(customer_id)?;
+        let (mut table, next_page_token) = self.report_table(&customer_id, &query, None).await?;
+        redact_search_term_pii(&mut table);
+        Ok(self
+            .render_report(
+                &customer_id,
+                dated(start_date, end_date, Some(limit)),
+                table,
+                next_page_token,
+            )
+            .await)
     }
 
     fn mutation_customer(&self, explicit: Option<&str>) -> Result<String> {
@@ -1324,28 +1785,162 @@ mod tests {
     #[test]
     fn search_terms_redact_email_and_phone_like_values() {
         let response = json!({
+            "fieldMask": "searchTermView.searchTerm,metrics.clicks",
             "results": [
-                { "searchTermView": { "searchTerm": "meeting api" } },
+                { "searchTermView": { "searchTerm": "meeting api" }, "metrics": { "clicks": "3" } },
                 { "searchTermView": { "searchTerm": "mailto:jane@example.com?subject=demo" } },
                 { "searchTermView": { "searchTerm": "call +33 6 12 34 56 78" } },
                 { "searchTermView": { "searchTerm": "reach jane@example.com." } }
             ]
         });
-        let redacted = redact_search_term_pii(response);
-        let rows = redacted["results"].as_array().unwrap();
-        assert_eq!(rows[0]["searchTermView"]["searchTerm"], "meeting api");
+        let mut table = tabulate(&response);
+        redact_search_term_pii(&mut table);
         assert_eq!(
-            rows[1]["searchTermView"]["searchTerm"],
-            "[REDACTED_POTENTIAL_PII]"
+            table.columns,
+            vec!["searchTermView.searchTerm", "metrics.clicks"]
+        );
+        assert_eq!(table.rows[0], vec![json!("meeting api"), json!("3")]);
+        for row in &table.rows[1..] {
+            assert_eq!(row[0], "[REDACTED_POTENTIAL_PII]");
+            assert_eq!(row[1], Value::Null);
+        }
+    }
+
+    #[test]
+    fn tabulate_uses_field_mask_columns_and_drops_resource_names() {
+        let response = json!({
+            "fieldMask": "campaign.id,adGroupCriterion.keyword.text,metrics.costMicros",
+            "queryResourceConsumption": "17",
+            "results": [{
+                "campaign": { "id": "1", "resourceName": "customers/9/campaigns/1" },
+                "adGroupCriterion": { "keyword": { "text": "meeting bot" } },
+                "metrics": { "costMicros": "240000" }
+            }]
+        });
+        let table = tabulate(&response);
+        assert_eq!(
+            table,
+            Table {
+                columns: vec![
+                    "campaign.id".into(),
+                    "adGroupCriterion.keyword.text".into(),
+                    "metrics.costMicros".into(),
+                ],
+                rows: vec![vec![json!("1"), json!("meeting bot"), json!("240000")]],
+            }
         );
         assert_eq!(
-            rows[2]["searchTermView"]["searchTerm"],
-            "[REDACTED_POTENTIAL_PII]"
+            tabulate(&json!({})),
+            Table {
+                columns: vec![],
+                rows: vec![]
+            }
         );
+    }
+
+    #[test]
+    fn api_error_detail_keeps_codes_and_messages_only() {
+        let body = r#"{"error":{"code":400,"message":"Request contains an invalid argument.","status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.ads.googleads.v25.errors.GoogleAdsFailure","errors":[{"errorCode":{"queryError":"UNRECOGNIZED_FIELD"},"message":"Unrecognized fields in the query: 'campaign.start_date'."},{"errorCode":{"fieldError":"REQUIRED"},"message":"missing","trigger":{"stringValue":"secret"},"location":{"fieldPathElements":[{"fieldName":"operations","index":0},{"fieldName":"update"}]}}],"requestId":"abc"}]}}"#;
+        let detail = extract_api_error_detail(body).unwrap();
         assert_eq!(
-            rows[3]["searchTermView"]["searchTerm"],
-            "[REDACTED_POTENTIAL_PII]"
+            detail,
+            "queryError.UNRECOGNIZED_FIELD: Unrecognized fields in the query: 'campaign.start_date'.; fieldError.REQUIRED: missing (at operations[0].update)"
         );
+        assert!(!detail.contains("secret"));
+        assert!(!detail.contains("abc"));
+        assert_eq!(extract_api_error_detail("<html>not json</html>"), None);
+        assert_eq!(
+            extract_api_error_detail(r#"{"error":{"message":"x"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn api_error_detail_is_bounded() {
+        let long = "x".repeat(2000);
+        let body = format!(
+            r#"{{"error":{{"details":[{{"errors":[{{"errorCode":{{"queryError":"BAD"}},"message":"{long}"}}]}}]}}}}"#
+        );
+        let detail = extract_api_error_detail(&body).unwrap();
+        assert!(detail.chars().count() <= MAX_ERROR_DETAIL_CHARS + 1);
+        assert!(detail.ends_with('…'));
+    }
+
+    #[test]
+    fn report_query_adds_filters_and_daily_segmentation() {
+        let filter = ReportFilter {
+            campaign_id: Some("123".into()),
+            ad_group_id: Some("456".into()),
+            daily: true,
+        };
+        let query = build_report_query(ReportQuery {
+            select: "campaign.id, ad_group.id, metrics.clicks",
+            from: "ad_group",
+            conditions: vec![date_condition("2026-09-01", "2026-09-04").unwrap()],
+            order_by: Some("metrics.cost_micros DESC"),
+            limit: 50,
+            filter: &filter,
+        })
+        .unwrap();
+        assert_eq!(
+            query,
+            "SELECT segments.date, campaign.id, ad_group.id, metrics.clicks FROM ad_group \
+             WHERE segments.date BETWEEN '2026-09-01' AND '2026-09-04' \
+             AND campaign.id = 123 AND ad_group.id = 456 \
+             ORDER BY segments.date, metrics.cost_micros DESC LIMIT 50"
+        );
+    }
+
+    #[test]
+    fn report_query_selects_filtered_fields_google_requires() {
+        let filter = ReportFilter {
+            campaign_id: Some("123".into()),
+            ad_group_id: Some("456".into()),
+            daily: false,
+        };
+        let query = build_report_query(ReportQuery {
+            select: "landing_page_view.unexpanded_final_url, metrics.clicks",
+            from: "landing_page_view",
+            conditions: Vec::new(),
+            order_by: None,
+            limit: 10,
+            filter: &filter,
+        })
+        .unwrap();
+        assert!(query.starts_with(
+            "SELECT ad_group.id, campaign.id, landing_page_view.unexpanded_final_url, metrics.clicks FROM"
+        ));
+        assert!(selects_field("campaign.id, campaign.name", "campaign.id"));
+        assert!(!selects_field(
+            "campaign.id_x, campaign.name",
+            "campaign.id"
+        ));
+    }
+
+    #[test]
+    fn report_query_rejects_non_numeric_filters_and_bad_limits() {
+        let filter = ReportFilter {
+            campaign_id: Some("123 OR 1=1".into()),
+            ..ReportFilter::default()
+        };
+        assert!(build_report_query(ReportQuery {
+            select: "campaign.id",
+            from: "campaign",
+            conditions: Vec::new(),
+            order_by: None,
+            limit: 10,
+            filter: &filter,
+        })
+        .is_err());
+        assert!(build_report_query(ReportQuery {
+            select: "campaign.id",
+            from: "campaign",
+            conditions: Vec::new(),
+            order_by: None,
+            limit: 0,
+            filter: &ReportFilter::default(),
+        })
+        .is_err());
     }
 
     #[test]
